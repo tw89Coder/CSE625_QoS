@@ -71,6 +71,11 @@ def resolve_filter_mode(args):
 
 
 def build_profiles(args, modes, rates):
+    if args.suite == "ablation":
+        return [
+            {"name": "FSM", "filter_mode": 1, "modes": [2], "rates": [0.1, 10.0]},
+            {"name": "STATIC-100", "filter_mode": 2, "modes": [2], "rates": [0.1, 10.0]},
+        ]
     if args.suite == "controls":
         return [
             {"name": "FSM", "filter_mode": 1, "modes": [2], "rates": [0.1, 10.0]},
@@ -164,7 +169,7 @@ def main():
         formatter_class=argparse.RawTextHelpFormatter,
         epilog="Examples:\n"
                "  python tools/sender/udp_sender.py --dest-ip 192.0.2.10 -F -o -m '0 1 2' -r '1.0 5.0 10.0' -I '1 20'\n"
-               "  python tools/sender/udp_sender.py --suite controls --dest-ip 192.0.2.10 -I '1 20'\n"
+               "  python tools/sender/udp_sender.py --suite ablation --dest-ip 192.0.2.10 -I '1 20'\n"
                "  python tools/sender/udp_sender.py --suite controls --dry-run -I '1 2'"
     )
     parser.add_argument("--dest-ip", type=str, default="127.0.0.1", help="C++ receiver address (default: 127.0.0.1).")
@@ -183,8 +188,8 @@ def main():
     parser.add_argument("--patched", action="store_true", help="Label output as using the recursion-depth-limited comparison receiver.")
     parser.add_argument(
         "--suite",
-        choices=("controls",),
-        help="Run a predefined comparison matrix; 'controls' selects its own baseline/FSM/static sessions.",
+        choices=("ablation", "controls"),
+        help="Run a predefined comparison matrix; 'ablation' runs FSM/static only, while 'controls' also includes the clean baseline.",
     )
     parser.add_argument("--dry-run", action="store_true", help="Print the resolved session order without loading payloads or sending UDP traffic.")
     parser.add_argument(
@@ -219,7 +224,7 @@ def main():
             sessions = sessions_for_run(
                 profiles,
                 run_id,
-                counterbalance=args.suite == "controls" and not args.shuffle_sessions,
+                counterbalance=args.suite is not None and not args.shuffle_sessions,
                 shuffle_sessions=args.shuffle_sessions,
             )
             order = " -> ".join(f"{name}(m{mode},{rate:.1f}%)" for name, _, mode, rate in sessions)
@@ -286,7 +291,7 @@ def main():
             run_sessions = sessions_for_run(
                 profiles,
                 run_id,
-                counterbalance=args.suite == "controls" and not args.shuffle_sessions,
+                counterbalance=args.suite is not None and not args.shuffle_sessions,
                 shuffle_sessions=args.shuffle_sessions,
             )
             for profile_name, filter_mode, mode, session_rate in run_sessions:

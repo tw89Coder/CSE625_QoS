@@ -24,14 +24,17 @@ percentage over the complete session. The pulse and periodic schedules
 concentrate that global budget into their active windows. `-I "1 20"` produces the 20-run layout consumed by
 `python tools/plot_engine.py -M --runs 1-20`.
 
-The predefined control suite runs Mode-2 FSM and static-100% comparisons at
-0.1% and 10%, plus a Mode-0 clean baseline. Odd and even trial IDs reverse the
-profile order to counterbalance temperature and CPU-frequency drift:
+The predefined ablation suite runs only the Mode-2 FSM and static-100%
+comparisons at 0.1% and 10%. Odd and even trial IDs reverse the profile order
+to counterbalance temperature and CPU-frequency drift:
 
 ```bash
 python tools/sender/udp_sender.py --dest-ip raspberrypi.local \
-  --suite controls -N 1000000 -l 3000 -I "1 20"
+  --suite ablation -N 1000000 -l 3000 -I "1 20"
 ```
+
+Use `--suite controls` instead when a clean Mode-0 baseline should also be
+collected in every trial.
 
 Use `--dry-run` to inspect the complete session order without loading payloads
 or opening a socket.
