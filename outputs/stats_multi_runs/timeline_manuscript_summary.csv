@@ -1,0 +1,5 @@
+mode,series,global_attack_rate_pct,region,region_definition,scheduled_attack_rate_within_region_pct,region_packet_samples,mean_ms,p99_ms,source_file
+mode1,native,10.0,attack,300000 <= packet_id < 500000,50.0,200000,5377.074046244675,10455.224499490003,multi_runs/mode1/run_15/unpatched/qos_attack_10.0_mode1.csv
+mode1,onnx,10.0,attack,300000 <= packet_id < 500000,50.0,200000,0.03025216277,0.06237018000000017,multi_runs/mode1/run_02/unpatched/qos_attack_10.0_mode1_onnx.csv
+mode2,native,10.0,attack,odd-numbered 100k-packet segments,20.0,500000,0.365090793752,2.1292623300000004,multi_runs/mode2/run_18/unpatched/qos_attack_10.0_mode2.csv
+mode2,onnx,10.0,attack,odd-numbered 100k-packet segments,20.0,500000,0.03677158524400002,0.057889,multi_runs/mode2/run_13/unpatched/qos_attack_10.0_mode2_onnx.csv

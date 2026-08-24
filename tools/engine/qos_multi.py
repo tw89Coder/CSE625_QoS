@@ -448,16 +448,26 @@ class QoSMultiPlotter(QoSPlotter):
         return df_summary
 
     @staticmethod
-    def _timeline_metric_row(mode, series, region, signal, values, source_file):
+    def _timeline_metric_row(
+        mode, series, region, signal, values, source_file,
+        region_definition, region_fraction_pct,
+    ):
         values = pd.Series(values).dropna()
         if values.empty:
             return None
         return {
             'mode': mode,
             'series': series,
+            'global_attack_rate_pct': 10.0,
             'region': region,
+            'region_definition': region_definition,
+            'region_fraction_pct': region_fraction_pct,
+            'scheduled_attack_rate_within_region_pct': (
+                10.0 * 100.0 / region_fraction_pct if region == 'attack' else 0.0
+            ),
             'signal': signal,
-            'samples': int(values.size),
+            'metric_scope': 'receiver_latency_within_region',
+            'region_packet_samples': int(values.size),
             'mean_ms': float(values.mean()),
             'median_ms': float(values.median()),
             'p99_ms': float(values.quantile(0.99)),
@@ -493,11 +503,28 @@ class QoSMultiPlotter(QoSPlotter):
 
             max_id = max(int(df['packet_id'].max()) for df in frames.values())
             if mode == 1:
-                attack_start, attack_end = int(max_id * 0.30), int(max_id * 0.50)
+                total_packets = max_id + 1
+                attack_start = total_packets * 3 // 10
+                attack_end_exclusive = total_packets * 5 // 10
                 region_masks = {
-                    'attack': lambda df: df['packet_id'].between(attack_start, attack_end),
-                    'clean': lambda df: ~df['packet_id'].between(attack_start, attack_end),
+                    'attack': lambda df: (
+                        (df['packet_id'] >= attack_start)
+                        & (df['packet_id'] < attack_end_exclusive)
+                    ),
+                    'clean': lambda df: ~(
+                        (df['packet_id'] >= attack_start)
+                        & (df['packet_id'] < attack_end_exclusive)
+                    ),
                 }
+                region_definitions = {
+                    'attack': (
+                        f'{attack_start} <= packet_id < {attack_end_exclusive}'
+                    ),
+                    'clean': (
+                        f'packet_id < {attack_start} or packet_id >= {attack_end_exclusive}'
+                    ),
+                }
+                region_fractions = {'attack': 20.0, 'clean': 80.0}
             else:
                 total_packets = max_id + 1
                 stride = total_packets // 10
@@ -510,6 +537,11 @@ class QoSMultiPlotter(QoSPlotter):
                     'attack': attack_mask,
                     'clean': lambda df: ~attack_mask(df),
                 }
+                region_definitions = {
+                    'attack': 'odd-numbered 100k-packet segments',
+                    'clean': 'even-numbered 100k-packet segments',
+                }
+                region_fractions = {'attack': 50.0, 'clean': 50.0}
 
             for series, df in frames.items():
                 filename = specs[series]
@@ -528,6 +560,7 @@ class QoSMultiPlotter(QoSPlotter):
                         row = self._timeline_metric_row(
                             f'mode{mode}', series, region, signal,
                             values[mask], source_file,
+                            region_definitions[region], region_fractions[region],
                         )
                         if row is not None:
                             rows.append(row)
@@ -538,7 +571,7 @@ class QoSMultiPlotter(QoSPlotter):
         timeline_df = pd.DataFrame(rows)
         output_path = os.path.join(self.stats_dir, 'timeline_representative_statistics.csv')
         timeline_df.to_csv(output_path, index=False)
-        LogStyle.log_success(f"Timeline manuscript statistics saved to: '{output_path}'")
+        LogStyle.log_success(f"Timeline diagnostic statistics saved to: '{output_path}'")
 
         # Keep the manuscript-facing terminal output comparable across modes:
         # raw attack-window mean and P99 only. The CSV retains the complete
@@ -546,11 +579,30 @@ class QoSMultiPlotter(QoSPlotter):
         manuscript_df = timeline_df[
             (timeline_df['region'] == 'attack')
             & (timeline_df['signal'] == 'raw')
+        ].copy()
+        manuscript_columns = [
+            'mode', 'series', 'global_attack_rate_pct', 'region',
+            'region_definition', 'scheduled_attack_rate_within_region_pct',
+            'region_packet_samples', 'mean_ms', 'p99_ms',
+            'source_file',
         ]
+        manuscript_df = manuscript_df[manuscript_columns]
+        manuscript_output_path = os.path.join(
+            self.stats_dir, 'timeline_manuscript_summary.csv'
+        )
+        manuscript_df.to_csv(manuscript_output_path, index=False)
+        LogStyle.log_success(
+            f"Four-row manuscript timeline summary saved to: "
+            f"'{manuscript_output_path}'"
+        )
         print("\n" + "=" * 82)
         print(" [MANUSCRIPT TIMELINE SUMMARY — RAW ATTACK-WINDOW METRICS]")
         print("=" * 82)
-        display_columns = ['mode', 'series', 'samples', 'mean_ms', 'p99_ms']
+        display_columns = [
+            'mode', 'series', 'global_attack_rate_pct',
+            'scheduled_attack_rate_within_region_pct',
+            'region_packet_samples', 'mean_ms', 'p99_ms',
+        ]
         print(manuscript_df[display_columns].to_string(
             index=False,
             formatters={
