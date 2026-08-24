@@ -15,6 +15,9 @@ class QoSPlotter(BasePlotter):
     bounds, compiles comparative performance summaries, and renders execution timelines.
     """
     JITTER_THRESHOLD_MS = 50.0  # Fixed threshold matching Raspberry Pi hardware testbed dataset
+    TIMELINE_NATIVE_COLOR = '#C44E52'
+    TIMELINE_FILTER_COLOR = '#4C72B0'
+    TIMELINE_CODEL_COLOR = '#DD8452'
     WARMUP = 100
     MODES = [0, 1, 2]
     RATES = [1.0, 5.0, 10.0]
@@ -66,14 +69,50 @@ class QoSPlotter(BasePlotter):
         df['latency_ms'] = df['latency_ns'] / 1e6
         df = df.iloc[self.WARMUP:].reset_index(drop=True)
         
-        # Apply strict OS scheduling noise filtration pass
-        before = len(df)
-        df = df[df['latency_ms'] < self.JITTER_THRESHOLD_MS].reset_index(drop=True)
-        after = len(df)
-        
-        if before != after:
-            LogStyle.log_info(f"Filtered {before - after} jitter spikes from [{environment}/{filename}].")
+        # Mode 1 contains sustained, queue-inclusive HoL latency above 50 ms;
+        # those samples are experimental signal rather than OS jitter.
+        if '_mode1' not in filename:
+            before = len(df)
+            df = df[df['latency_ms'] < self.JITTER_THRESHOLD_MS].reset_index(drop=True)
+            after = len(df)
+
+            if before != after:
+                LogStyle.log_info(f"Filtered {before - after} jitter spikes from [{environment}/{filename}].")
         return df
+
+    def _resolve_timeline_dataframe(self, environment, filename):
+        """Load an untrimmed latency trace for display-capped timelines."""
+        target_path = os.path.join(self.raw_dir, environment, filename)
+        if not os.path.exists(target_path):
+            return None
+
+        df = self._load_csv_file(target_path)
+        lat_col = (
+            'latency_ns' if 'latency_ns' in df.columns
+            else ('queue_delay_ns' if 'queue_delay_ns' in df.columns else 'delay_ns')
+        )
+        df['latency_ms'] = df[lat_col] / 1e6
+        return df.iloc[self.WARMUP:].reset_index(drop=True)
+
+    @staticmethod
+    def _timeline_display_limit(values):
+        """Choose a readable linear ceiling without changing source values."""
+        target = float(values.quantile(0.999))
+        for ceiling in (0.5, 1.0, 2.0, 5.0, 8.0, 10.0):
+            if target <= ceiling:
+                return ceiling
+        return 10.0
+
+    @staticmethod
+    def _mark_capped_axis(ax, ceiling):
+        """Make display-only clipping explicit at the top y-axis tick."""
+        ticks = list(ax.get_yticks())
+        if not ticks or not np.isclose(ticks[-1], ceiling):
+            ticks = [tick for tick in ticks if tick < ceiling] + [ceiling]
+        labels = [f'{tick:g}' for tick in ticks]
+        labels[-1] = f'≥{ceiling:g}'
+        ax.set_yticks(ticks)
+        ax.set_yticklabels(labels)
 
     def _calculate_security_vectors(self, df):
         if 'was_dropped' not in df.columns or 'is_malware' not in df.columns:
@@ -349,9 +388,9 @@ class QoSPlotter(BasePlotter):
     def plot_pulse_timeline(self):
         LogStyle.log_stage("Generating Pulse Attack Mitigation Timeline (Mode 1)...")
         suffix = "_onnx.csv" if self.use_onnx else "_filtered.csv"
-        df_native = self._resolve_dataframe('unpatched', 'qos_attack_10.0_mode1.csv')
-        df_codel  = self._resolve_dataframe('unpatched', 'qos_attack_10.0_mode1_codel.csv')
-        df_filter = self._resolve_dataframe('unpatched', f'qos_attack_10.0_mode1{suffix}')
+        df_native = self._resolve_timeline_dataframe('unpatched', 'qos_attack_10.0_mode1.csv')
+        df_codel  = self._resolve_timeline_dataframe('unpatched', 'qos_attack_10.0_mode1_codel.csv')
+        df_filter = self._resolve_timeline_dataframe('unpatched', f'qos_attack_10.0_mode1{suffix}')
 
         if df_native is None or df_filter is None:
             LogStyle.log_warn("Aborting Pulse Timeline: Missing required mode1 target execution matrix dependencies.")
@@ -365,20 +404,43 @@ class QoSPlotter(BasePlotter):
         df_fil_zoom = df_filter[df_filter['packet_id'].between(window_start, window_end)]
         df_cod_zoom = df_codel[df_codel['packet_id'].between(window_start, window_end)] if df_codel is not None else None
 
-        fig, ax = plt.subplots(figsize=(14, 6))
-        ax.plot(df_nat_zoom['packet_id'], df_nat_zoom['latency_ms'], 
-                label='Unpatched Native (No Defense)', color='#d62728', linewidth=1.0, alpha=0.5)
+        # Use the raw trace for temporal continuity, but keep a readable linear
+        # display scale.  Values above the axis remain in the source data and
+        # are clipped only by the plot viewport.
+        display_frames = [df_nat_zoom, df_fil_zoom]
         if df_cod_zoom is not None and not df_cod_zoom.empty:
-            ax.plot(df_cod_zoom['packet_id'], df_cod_zoom['latency_ms'],
-                    label='CoDel Baseline (RFC 8289)', color='#ff7f0e', linewidth=1.2, linestyle='-.', alpha=0.8)
-        filter_label = 'Proposed Filter (ONNX)' if self.use_onnx else 'Proposed Filter (FSM)'
-        ax.plot(df_fil_zoom['packet_id'], df_fil_zoom['latency_ms'], 
-                label=filter_label, color='#1f77b4', linewidth=1.2, alpha=0.9)
+            display_frames.append(df_cod_zoom)
+        display_values = pd.concat(
+            [frame['latency_ms'] for frame in display_frames],
+            ignore_index=True,
+        )
+        dynamic_upper = self._timeline_display_limit(display_values)
 
-        import math
-        raw_p999_pulse = df_nat_zoom['latency_ms'].quantile(0.999)
-        y_limit_pulse = float(math.ceil(raw_p999_pulse)) if raw_p999_pulse >= 1.0 else (math.ceil(raw_p999_pulse * 10.0) / 10.0)
-        ax.set_ylim(0, max(0.45, y_limit_pulse)) 
+        def display_latency(frame):
+            # Keep saturated samples just inside the axes so vector renderers
+            # do not hide the trace underneath the top spine.
+            return frame['latency_ms'].clip(upper=dynamic_upper * 0.995)
+
+        fig, ax = plt.subplots(figsize=(14, 6))
+        native_display = display_latency(df_nat_zoom)
+        ax.fill_between(
+            df_nat_zoom['packet_id'], 0, native_display,
+            color=self.TIMELINE_NATIVE_COLOR, alpha=0.22, linewidth=0, zorder=1,
+        )
+        ax.plot(
+            df_nat_zoom['packet_id'], native_display,
+            label='Unpatched Native (No Defense)', color=self.TIMELINE_NATIVE_COLOR,
+            linewidth=1.0, alpha=0.65, zorder=3,
+        )
+        if df_cod_zoom is not None and not df_cod_zoom.empty:
+            ax.plot(df_cod_zoom['packet_id'], display_latency(df_cod_zoom),
+                    label='CoDel Baseline (RFC 8289)', color=self.TIMELINE_CODEL_COLOR, linewidth=1.2, linestyle='-.', alpha=0.8)
+        filter_label = 'Proposed Filter (ONNX)' if self.use_onnx else 'Proposed Filter (FSM)'
+        ax.plot(df_fil_zoom['packet_id'], display_latency(df_fil_zoom),
+                label=filter_label, color=self.TIMELINE_FILTER_COLOR, linewidth=1.2, alpha=0.9, zorder=2)
+
+        ax.set_ylim(0, dynamic_upper)
+        self._mark_capped_axis(ax, dynamic_upper)
         ax.set_xlim(window_start, window_end)
         ax.set_xlabel('Packet ID (Chronological Order)', fontsize=24, labelpad=8)
         ax.set_ylabel('Processing Latency (ms)', fontsize=24, labelpad=8)
@@ -393,9 +455,9 @@ class QoSPlotter(BasePlotter):
     def plot_periodic_timeline(self):
         LogStyle.log_stage("Generating Periodic Flapping Resilience Timeline (Mode 2)...")
         suffix = "_onnx.csv" if self.use_onnx else "_filtered.csv"
-        df_native = self._resolve_dataframe('unpatched', 'qos_attack_10.0_mode2.csv')
-        df_codel  = self._resolve_dataframe('unpatched', 'qos_attack_10.0_mode2_codel.csv')
-        df_filter = self._resolve_dataframe('unpatched', f'qos_attack_10.0_mode2{suffix}')
+        df_native = self._resolve_timeline_dataframe('unpatched', 'qos_attack_10.0_mode2.csv')
+        df_codel  = self._resolve_timeline_dataframe('unpatched', 'qos_attack_10.0_mode2_codel.csv')
+        df_filter = self._resolve_timeline_dataframe('unpatched', f'qos_attack_10.0_mode2{suffix}')
 
         if df_native is None or df_filter is None:
             LogStyle.log_warn("Aborting Periodic Timeline: Missing required mode2 target execution matrix dependencies.")
@@ -407,20 +469,32 @@ class QoSPlotter(BasePlotter):
         if df_codel is not None and not df_codel.empty:
             df_codel['smoothed_latency'] = df_codel['latency_ms'].rolling(window=ROLLING_WINDOW, min_periods=1).mean()
 
-        fig, ax = plt.subplots(figsize=(14, 6))
-        ax.plot(df_filter['packet_id'], df_filter['latency_ms'], color='#1f77b4', linewidth=0.6, alpha=0.2, zorder=1)
-        ax.plot(df_native['packet_id'], df_native['latency_ms'], color='#d62728', linewidth=0.7, alpha=0.25, zorder=2)
+        display_frames = [df_native, df_filter]
         if df_codel is not None and not df_codel.empty:
-            ax.plot(df_codel['packet_id'], df_codel['latency_ms'], color='#ff7f0e', linewidth=0.7, alpha=0.2, zorder=2)
+            display_frames.append(df_codel)
+        display_values = pd.concat(
+            [frame['latency_ms'] for frame in display_frames],
+            ignore_index=True,
+        )
+        dynamic_upper = self._timeline_display_limit(display_values)
+
+        def display_latency(frame):
+            return frame['latency_ms'].clip(upper=dynamic_upper)
+
+        fig, ax = plt.subplots(figsize=(14, 6))
+        ax.plot(df_filter['packet_id'], display_latency(df_filter), color=self.TIMELINE_FILTER_COLOR, linewidth=0.6, alpha=0.2, zorder=1)
+        ax.plot(df_native['packet_id'], display_latency(df_native), color=self.TIMELINE_NATIVE_COLOR, linewidth=0.7, alpha=0.25, zorder=2)
+        if df_codel is not None and not df_codel.empty:
+            ax.plot(df_codel['packet_id'], display_latency(df_codel), color=self.TIMELINE_CODEL_COLOR, linewidth=0.7, alpha=0.2, zorder=2)
 
         filter_label = 'Proposed Filter (ONNX, Smoothed)' if self.use_onnx else 'Proposed Filter (FSM, Smoothed)'
         ax.plot(df_filter['packet_id'], df_filter['smoothed_latency'], 
-                label=filter_label, color='#1f77b4', linewidth=1.5, alpha=0.9, zorder=4)
+                label=filter_label, color=self.TIMELINE_FILTER_COLOR, linewidth=1.5, alpha=0.9, zorder=4)
         if df_codel is not None and not df_codel.empty:
             ax.plot(df_codel['packet_id'], df_codel['smoothed_latency'],
-                    label='CoDel Baseline (RFC 8289, Smoothed)', color='#ff7f0e', linewidth=1.5, linestyle='-.', alpha=0.9, zorder=3)
+                    label='CoDel Baseline (RFC 8289, Smoothed)', color=self.TIMELINE_CODEL_COLOR, linewidth=1.5, linestyle='-.', alpha=0.9, zorder=3)
         ax.plot(df_native['packet_id'], df_native['smoothed_latency'], 
-                label='Unpatched Native (Smoothed)', color='#d62728', linewidth=1.5, alpha=0.9, zorder=5)
+                label='Unpatched Native (Smoothed)', color=self.TIMELINE_NATIVE_COLOR, linewidth=1.5, alpha=0.9, zorder=5)
 
         total_packet_indices = int(max(
             df_native['packet_id'].max(),
@@ -440,11 +514,8 @@ class QoSPlotter(BasePlotter):
                 else:
                     ax.axvspan(lower_bound, upper_bound, color='gray', alpha=0.2)
 
-        import math
-        # Dynamically set Y-axis limit using math.ceil on Native raw P99.9 quantile (rounded up for clean padding)
-        raw_p999 = df_native['latency_ms'].quantile(0.999)
-        y_limit = float(math.ceil(raw_p999)) if raw_p999 >= 1.0 else (math.ceil(raw_p999 * 10.0) / 10.0)
-        ax.set_ylim(0, max(0.45, y_limit))
+        ax.set_ylim(0, dynamic_upper)
+        self._mark_capped_axis(ax, dynamic_upper)
         ax.set_xlim(0, total_packet_indices)
         ax.set_xlabel('Packet ID (Chronological Order)', fontsize=24, labelpad=8)
         ax.set_ylabel('Processing Latency (ms)', fontsize=24, labelpad=8)

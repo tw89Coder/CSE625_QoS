@@ -74,11 +74,27 @@ class QoSMultiPlotter(QoSPlotter):
                 lat_col = 'latency_ns' if 'latency_ns' in df.columns else ('queue_delay_ns' if 'queue_delay_ns' in df.columns else 'delay_ns')
                 df['latency_ms'] = df[lat_col] / 1e6
                 df = df.iloc[self.WARMUP:].reset_index(drop=True)
-                df = df[df['latency_ms'] < self.JITTER_THRESHOLD_MS].reset_index(drop=True)
+                if '_mode1' not in filename:
+                    df = df[df['latency_ms'] < self.JITTER_THRESHOLD_MS].reset_index(drop=True)
                 return df
 
         # Fallback to single-run raw folder
         return super()._resolve_dataframe(environment, filename)
+
+    def _resolve_timeline_dataframe(self, environment, filename):
+        """Resolve the representative trial without the 50-ms stats filter."""
+        if filename in self.median_run_map:
+            rep_path = self.median_run_map[filename]
+            if os.path.exists(rep_path):
+                df = self._load_csv_file(rep_path)
+                lat_col = (
+                    'latency_ns' if 'latency_ns' in df.columns
+                    else ('queue_delay_ns' if 'queue_delay_ns' in df.columns else 'delay_ns')
+                )
+                df['latency_ms'] = df[lat_col] / 1e6
+                return df.iloc[self.WARMUP:].reset_index(drop=True)
+
+        return super()._resolve_timeline_dataframe(environment, filename)
 
     def process_all_multi_runs(self):
         """
@@ -607,7 +623,8 @@ class QoSMultiPlotter(QoSPlotter):
             lat_col = 'latency_ns' if 'latency_ns' in df.columns else ('queue_delay_ns' if 'queue_delay_ns' in df.columns else 'delay_ns')
             lat_ms = df[lat_col] / 1e6
             lat_ms = lat_ms.iloc[self.WARMUP:]
-            lat_ms = lat_ms[lat_ms < self.JITTER_THRESHOLD_MS]
+            if '_mode1' not in os.path.basename(filepath):
+                lat_ms = lat_ms[lat_ms < self.JITTER_THRESHOLD_MS]
 
             p95 = np.percentile(lat_ms, 95)
             p99 = np.percentile(lat_ms, 99)
