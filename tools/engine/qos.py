@@ -6,6 +6,7 @@ import struct
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.ticker import ScalarFormatter
 from engine.base import BasePlotter
 from engine.logger import LogStyle
 
@@ -269,10 +270,10 @@ class QoSPlotter(BasePlotter):
         df_pf   = None if self.use_onnx else self._resolve_dataframe('patched',   f'qos_attack_{target_rate}_mode{target_mode}{suffix}.csv')
 
         series_map = [
-            ("Baseline (Peacetime)", df_b,     '#55a868', '-',  3),  # Green
-            ("Unpatched (No Filter)", df_un,   '#c44e52', '-',  1),  # Red (No defense, tail explosion)
-            ("CoDel Baseline (RFC 8289)", df_codel, '#ff7f0e', '-.', 2),  # Orange (CoDel AQM Queue Protection)
-            ("Proposed Fast-Path (Ours)", df_unf, '#4c72b0', ':',  2),  # Blue (Our adaptive pre-filter)
+            ("Baseline (Peacetime)", df_b,     '#55a868', '--', 5),  # Green, rendered above overlapping defended trace
+            ("Proposed Fast-Path (Ours)", df_unf, '#4c72b0', '-',  4),  # Blue (primary result, rendered on top)
+            ("Unpatched (No Filter)", df_un,   '#c44e52', '-',  2),  # Red (No defense, tail explosion)
+            ("CoDel Baseline (RFC 8289)", df_codel, '#DD8452', '-.', 3),  # Seaborn orange (CoDel AQM Queue Protection)
         ]
         if not self.use_onnx and not self.no_patched:
             series_map.extend([
@@ -303,8 +304,13 @@ class QoSPlotter(BasePlotter):
         for label, df, color, ls, z in series_map:
             if df is not None and not df.empty:
                 plot_df = df.iloc[start_idx:end_idx]
+                is_proposed = label == "Proposed Fast-Path (Ours)"
+                is_baseline = label == "Baseline (Peacetime)"
                 ax1.plot(plot_df['packet_id'], plot_df['latency_ms'],
-                         label=label, color=color, linestyle=ls, linewidth=1.5, alpha=0.8, zorder=z)
+                         label=label, color=color, linestyle=ls,
+                         linewidth=2.0 if is_proposed else (1.6 if is_baseline else 1.3),
+                         alpha=1.0 if (is_proposed or is_baseline) else 0.75,
+                         zorder=z)
                 # Filter extreme OS outliers: Use P99.9 or P99 for Y-limit
                 local_p999 = plot_df['latency_ms'].quantile(0.999)
                 if local_p999 > max_y:
@@ -312,7 +318,7 @@ class QoSPlotter(BasePlotter):
 
         ax1.set_ylim(-0.005, max_y * 1.15)
         ax1.set_xlabel('Packet Sequence Index (n)', fontsize=11)
-        ax1.set_ylabel('Processing Latency (ms)', fontsize=11)
+        ax1.set_ylabel('Receiver-Side Latency (ms)', fontsize=11)
         ax1.grid(True, linestyle=':', alpha=0.7)
         ax1.legend(loc='upper right', fontsize=8.5, frameon=True, edgecolor='#cccccc', framealpha=0.9)
         ax1.tick_params(axis='both', labelsize=9.5)
@@ -334,7 +340,15 @@ class QoSPlotter(BasePlotter):
             if df is not None and not df.empty:
                 sorted_lat = np.sort(df['latency_ms'])
                 probabilities = np.arange(len(sorted_lat)) / float(len(sorted_lat) - 1)
-                ax2.plot(sorted_lat, probabilities, label=label, color=color, linestyle=ls, linewidth=1.5, alpha=0.9, zorder=z)
+                is_proposed = label == "Proposed Fast-Path (Ours)"
+                is_baseline = label == "Baseline (Peacetime)"
+                ax2.plot(
+                    sorted_lat, probabilities, label=label, color=color,
+                    linestyle=ls,
+                    linewidth=2.0 if is_proposed else (1.6 if is_baseline else 1.3),
+                    alpha=1.0 if (is_proposed or is_baseline) else 0.8,
+                    zorder=z,
+                )
 
         # Draw the 99th percentile horizontal guideline
         ax2.axhline(y=0.99, color='black', linestyle='-', alpha=0.2, linewidth=1.0)
@@ -369,7 +383,7 @@ class QoSPlotter(BasePlotter):
         else:
             ax2.set_xlim(1e-2, 10.0)
 
-        ax2.set_xlabel('Latency (ms) [Log Scale]', fontsize=11)
+        ax2.set_xlabel('Receiver-Side Latency (ms) [Log Scale]', fontsize=11)
         ax2.set_ylabel('CDF Probability', fontsize=11)
         ax2.grid(True, which="both", linestyle=':', alpha=0.7)
         ax2.legend(loc='lower right', fontsize=8.5, frameon=True, edgecolor='#cccccc', framealpha=0.9)
@@ -397,56 +411,86 @@ class QoSPlotter(BasePlotter):
             return
 
         max_id = max(df_native['packet_id'].max(), df_filter['packet_id'].max())
-        start_attack, end_attack = int(max_id * 0.30), int(max_id * 0.50)
-        window_start, window_end = int(max_id * 0.25), int(max_id * 0.60)
+        total_packets = int(max_id) + 1
+        start_attack = total_packets * 3 // 10
+        end_attack = total_packets * 5 // 10
+        window_start, window_end = total_packets // 4, total_packets * 3 // 5
+
+        rolling_window = 500
+        df_native['smoothed_latency'] = df_native['latency_ms'].rolling(
+            window=rolling_window, min_periods=1
+        ).mean()
+        df_filter['smoothed_latency'] = df_filter['latency_ms'].rolling(
+            window=rolling_window, min_periods=1
+        ).mean()
+        if df_codel is not None and not df_codel.empty:
+            df_codel['smoothed_latency'] = df_codel['latency_ms'].rolling(
+                window=rolling_window, min_periods=1
+            ).mean()
 
         df_nat_zoom = df_native[df_native['packet_id'].between(window_start, window_end)]
         df_fil_zoom = df_filter[df_filter['packet_id'].between(window_start, window_end)]
         df_cod_zoom = df_codel[df_codel['packet_id'].between(window_start, window_end)] if df_codel is not None else None
 
-        # Use the raw trace for temporal continuity, but keep a readable linear
-        # display scale.  Values above the axis remain in the source data and
-        # are clipped only by the plot viewport.
-        display_frames = [df_nat_zoom, df_fil_zoom]
-        if df_cod_zoom is not None and not df_cod_zoom.empty:
-            display_frames.append(df_cod_zoom)
-        display_values = pd.concat(
-            [frame['latency_ms'] for frame in display_frames],
-            ignore_index=True,
-        )
-        dynamic_upper = self._timeline_display_limit(display_values)
+        # Mode 1 spans roughly five orders of magnitude. A logarithmic axis
+        # preserves both the defended trace and the native backlog trajectory
+        # without clipping either series.
+        log_floor = 1e-3
 
-        def display_latency(frame):
-            # Keep saturated samples just inside the axes so vector renderers
-            # do not hide the trace underneath the top spine.
-            return frame['latency_ms'].clip(upper=dynamic_upper * 0.995)
+        def display_latency(values):
+            return values.clip(lower=log_floor)
 
         fig, ax = plt.subplots(figsize=(14, 6))
-        native_display = display_latency(df_nat_zoom)
-        ax.fill_between(
-            df_nat_zoom['packet_id'], 0, native_display,
-            color=self.TIMELINE_NATIVE_COLOR, alpha=0.22, linewidth=0, zorder=1,
+        ax.axvspan(
+            start_attack, end_attack, color='gray', alpha=0.14,
+            label='Attack window', zorder=0,
+        )
+        native_raw_label = 'Native raw'
+        filter_raw_label = 'Filter raw'
+        ax.plot(
+            df_nat_zoom['packet_id'], display_latency(df_nat_zoom['latency_ms']),
+            label=native_raw_label, color=self.TIMELINE_NATIVE_COLOR,
+            linewidth=0.8, alpha=0.72, zorder=4,
         )
         ax.plot(
-            df_nat_zoom['packet_id'], native_display,
-            label='Unpatched Native (No Defense)', color=self.TIMELINE_NATIVE_COLOR,
-            linewidth=1.0, alpha=0.65, zorder=3,
+            df_fil_zoom['packet_id'], display_latency(df_fil_zoom['latency_ms']),
+            label=filter_raw_label, color=self.TIMELINE_FILTER_COLOR,
+            linewidth=0.7, alpha=0.72, zorder=3,
         )
         if df_cod_zoom is not None and not df_cod_zoom.empty:
-            ax.plot(df_cod_zoom['packet_id'], display_latency(df_cod_zoom),
-                    label='CoDel Baseline (RFC 8289)', color=self.TIMELINE_CODEL_COLOR, linewidth=1.2, linestyle='-.', alpha=0.8)
-        filter_label = 'Proposed Filter (ONNX)' if self.use_onnx else 'Proposed Filter (FSM)'
-        ax.plot(df_fil_zoom['packet_id'], display_latency(df_fil_zoom),
-                label=filter_label, color=self.TIMELINE_FILTER_COLOR, linewidth=1.2, alpha=0.9, zorder=2)
-
-        ax.set_ylim(0, dynamic_upper)
-        self._mark_capped_axis(ax, dynamic_upper)
+            ax.plot(
+                df_cod_zoom['packet_id'], display_latency(df_cod_zoom['latency_ms']),
+                label='CoDel raw', color=self.TIMELINE_CODEL_COLOR,
+                linewidth=0.7, alpha=0.72, zorder=3,
+            )
+        codel_label = 'CoDel raw'
+        ax.set_yscale('log')
+        ax.set_ylim(1e-2, 2e4)
         ax.set_xlim(window_start, window_end)
-        ax.set_xlabel('Packet ID (Chronological Order)', fontsize=24, labelpad=8)
-        ax.set_ylabel('Processing Latency (ms)', fontsize=24, labelpad=8)
-        ax.tick_params(axis='both', which='major', labelsize=20)
+        ax.set_xlabel('Packet ID (Chronological Order)', fontsize=31, labelpad=8)
+        ax.set_ylabel('Latency (ms)', fontsize=31, labelpad=8)
+        x_formatter = ScalarFormatter(useMathText=True)
+        x_formatter.set_scientific(True)
+        x_formatter.set_powerlimits((5, 5))
+        ax.xaxis.set_major_formatter(x_formatter)
+        ax.tick_params(axis='both', which='major', labelsize=27)
+        ax.xaxis.get_offset_text().set_fontsize(27)
         ax.grid(True, linestyle=':', alpha=0.7)
-        ax.legend(loc='upper right', fontsize=18)
+        handles, labels = ax.get_legend_handles_labels()
+        label_to_handle = dict(zip(labels, handles))
+        legend_order = [
+            native_raw_label,
+            filter_raw_label,
+            codel_label,
+            'Attack window',
+        ]
+        legend_order = [label for label in legend_order if label in label_to_handle]
+        ax.legend(
+            [label_to_handle[label] for label in legend_order], legend_order,
+            loc='upper right', bbox_to_anchor=(0.99, 0.72),
+            ncol=1, fontsize=24, framealpha=0.9,
+        )
+        fig.subplots_adjust(left=0.16, right=0.98, bottom=0.23, top=0.97)
 
         out_suffix = "_onnx" if self.use_onnx else ""
         self.export_figure(fig, "qos/timeline", f"pulse_recovery_timeline{out_suffix}")
@@ -482,19 +526,30 @@ class QoSPlotter(BasePlotter):
             return frame['latency_ms'].clip(upper=dynamic_upper)
 
         fig, ax = plt.subplots(figsize=(14, 6))
-        ax.plot(df_filter['packet_id'], display_latency(df_filter), color=self.TIMELINE_FILTER_COLOR, linewidth=0.6, alpha=0.2, zorder=1)
-        ax.plot(df_native['packet_id'], display_latency(df_native), color=self.TIMELINE_NATIVE_COLOR, linewidth=0.7, alpha=0.25, zorder=2)
+        native_raw_label = 'Native raw'
+        filter_raw_label = 'Filter raw'
+        ax.plot(df_native['packet_id'], display_latency(df_native),
+                label=native_raw_label, color=self.TIMELINE_NATIVE_COLOR,
+                linewidth=0.7, linestyle='--', alpha=0.55, zorder=1)
         if df_codel is not None and not df_codel.empty:
-            ax.plot(df_codel['packet_id'], display_latency(df_codel), color=self.TIMELINE_CODEL_COLOR, linewidth=0.7, alpha=0.2, zorder=2)
+            ax.plot(df_codel['packet_id'], display_latency(df_codel), color=self.TIMELINE_CODEL_COLOR, linewidth=0.7, alpha=0.36, zorder=2)
+        ax.plot(df_filter['packet_id'], display_latency(df_filter),
+                label=filter_raw_label, color=self.TIMELINE_FILTER_COLOR,
+                linewidth=0.6, linestyle='--', alpha=0.50, zorder=3)
 
-        filter_label = 'Proposed Filter (ONNX, Smoothed)' if self.use_onnx else 'Proposed Filter (FSM, Smoothed)'
-        ax.plot(df_filter['packet_id'], df_filter['smoothed_latency'], 
-                label=filter_label, color=self.TIMELINE_FILTER_COLOR, linewidth=1.5, alpha=0.9, zorder=4)
+        filter_label = 'Filter mean\n(500 pkt)' if self.use_onnx else 'FSM mean\n(500 pkt)'
+        native_label = 'Native mean\n(500 pkt)'
+        codel_label = 'CoDel mean\n(500 pkt)'
+        ax.plot(df_native['packet_id'], df_native['smoothed_latency'],
+                label=native_label, color=self.TIMELINE_NATIVE_COLOR,
+                linewidth=1.7, alpha=1.0, zorder=4)
         if df_codel is not None and not df_codel.empty:
             ax.plot(df_codel['packet_id'], df_codel['smoothed_latency'],
-                    label='CoDel Baseline (RFC 8289, Smoothed)', color=self.TIMELINE_CODEL_COLOR, linewidth=1.5, linestyle='-.', alpha=0.9, zorder=3)
-        ax.plot(df_native['packet_id'], df_native['smoothed_latency'], 
-                label='Unpatched Native (Smoothed)', color=self.TIMELINE_NATIVE_COLOR, linewidth=1.5, alpha=0.9, zorder=5)
+                    label=codel_label, color=self.TIMELINE_CODEL_COLOR,
+                    linewidth=1.7, linestyle='-.', alpha=1.0, zorder=5)
+        ax.plot(df_filter['packet_id'], df_filter['smoothed_latency'],
+                label=filter_label, color=self.TIMELINE_FILTER_COLOR,
+                linewidth=1.7, alpha=1.0, zorder=6)
 
         total_packet_indices = int(max(
             df_native['packet_id'].max(),
@@ -509,7 +564,7 @@ class QoSPlotter(BasePlotter):
                 lower_bound = iteration * stride_len
                 upper_bound = (iteration + 1) * stride_len
                 if not legend_appended:
-                    ax.axvspan(lower_bound, upper_bound, color='gray', alpha=0.2, label='Attack Active Window')
+                    ax.axvspan(lower_bound, upper_bound, color='gray', alpha=0.2, label='Attack window')
                     legend_appended = True
                 else:
                     ax.axvspan(lower_bound, upper_bound, color='gray', alpha=0.2)
@@ -517,11 +572,24 @@ class QoSPlotter(BasePlotter):
         ax.set_ylim(0, dynamic_upper)
         self._mark_capped_axis(ax, dynamic_upper)
         ax.set_xlim(0, total_packet_indices)
-        ax.set_xlabel('Packet ID (Chronological Order)', fontsize=24, labelpad=8)
-        ax.set_ylabel('Processing Latency (ms)', fontsize=24, labelpad=8)
-        ax.tick_params(axis='both', which='major', labelsize=20)
+        ax.set_xlabel('Packet ID (Chronological Order)', fontsize=31, labelpad=8)
+        ax.set_ylabel('Latency (ms)', fontsize=31, labelpad=8)
+        ax.tick_params(axis='both', which='major', labelsize=27)
+        ax.xaxis.get_offset_text().set_fontsize(27)
         ax.grid(True, linestyle=':', alpha=0.7)
-        ax.legend(loc='upper right', fontsize=18)
+        handles, labels = ax.get_legend_handles_labels()
+        label_to_handle = dict(zip(labels, handles))
+        legend_order = [
+            native_raw_label, filter_raw_label,
+            native_label, filter_label, codel_label,
+            'Attack window',
+        ]
+        legend_order = [label for label in legend_order if label in label_to_handle]
+        ax.legend(
+            [label_to_handle[label] for label in legend_order], legend_order,
+            loc='upper right', ncol=1, fontsize=24, framealpha=0.9,
+        )
+        fig.subplots_adjust(left=0.16, right=0.98, bottom=0.23, top=0.97)
 
         out_suffix = "_onnx" if self.use_onnx else ""
         self.export_figure(fig, "qos/timeline", f"periodic_recovery_timeline{out_suffix}")
